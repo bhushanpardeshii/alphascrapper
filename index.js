@@ -5,6 +5,7 @@ const path = require('path');
 
 // User-configurable: Change this for each instance of the scraper
 const TARGET_ALPHABET = 'b'; // e.g., 'a', 'b', 'c', ..., '0-9'
+const CONCURRENCY_LIMIT = 10; // Number of parallel requests
 
 const BASE_URL_PREFIX = 'https://theorg.com/companies';
 const OUTPUT_CSV = path.join(__dirname, `output_${TARGET_ALPHABET}_cheerio.csv`);
@@ -47,7 +48,7 @@ async function fetchPage(url) {
             } else if (err.response && err.response.status === 404) {
                 // Only skip for 404 Not Found
                 console.error(`Page not found (404) for ${url}. Skipping.`);
-                return null;
+                return '404'; // Return special value for 404
             } else if (err.response && err.response.status >= 500) {
                 // Retry on server errors
                 console.error(`Server error (${err.response.status}) while fetching ${url}. Retrying in 30 seconds...`);
@@ -70,6 +71,73 @@ function saveProgress(pageNum) {
         lastPageNum: pageNum,
         processedCompanies: Array.from(processedCompaniesSet)
     }));
+}
+
+async function processCompany(company, pageUrl, retryCount = 0) {
+    const MAX_RETRIES = 3;
+    try {
+        let homepageUrl = '';
+        let companyHtml = await fetchPage(company.url);
+
+        if (companyHtml === '404') {
+            // Handle actual 404 case
+            fs.appendFileSync(
+                OUTPUT_CSV,
+                `"${pageUrl}","${company.name}","NOT_FOUND"\n`
+            );
+            processedCompaniesSet.add(company.name);
+            console.log(`Company ${company.name} not found (404), skipping retries`);
+            return true;
+        } else if (!companyHtml) {
+            // Handle other errors (timeouts, network issues, etc.)
+            throw new Error('Failed to fetch company page');
+        }
+
+        const $$ = cheerio.load(companyHtml);
+        const homepageLink = $$('a[title="View the website"]');
+        if (homepageLink.length > 0) {
+            homepageUrl = homepageLink.attr('href') || '';
+        }
+
+        fs.appendFileSync(
+            OUTPUT_CSV,
+            `"${pageUrl}","${company.name}","${homepageUrl}"\n`
+        );
+        processedCompaniesSet.add(company.name);
+        console.log(`Saved: ${company.name}`);
+        return true;
+    } catch (error) {
+        if (retryCount < MAX_RETRIES) {
+            console.log(`Retrying company ${company.name} (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+            await new Promise(resolve => setTimeout(resolve, 30000)); // Wait 30 seconds before retry
+            return processCompany(company, pageUrl, retryCount + 1);
+        } else {
+            console.error(`Failed to process company ${company.name} after ${MAX_RETRIES} attempts`);
+            return false;
+        }
+    }
+}
+
+async function processBatch(companies, pageUrl) {
+    const chunks = [];
+    for (let i = 0; i < companies.length; i += CONCURRENCY_LIMIT) {
+        chunks.push(companies.slice(i, i + CONCURRENCY_LIMIT));
+    }
+
+    for (const chunk of chunks) {
+        const results = await Promise.all(chunk.map(company => processCompany(company, pageUrl)));
+
+        // Filter out failed companies and retry them
+        const failedCompanies = chunk.filter((_, index) => !results[index]);
+        if (failedCompanies.length > 0) {
+            console.log(`Retrying ${failedCompanies.length} failed companies...`);
+            for (const company of failedCompanies) {
+                await processCompany(company, pageUrl);
+            }
+        }
+
+        saveProgress(progress.lastPageNum);
+    }
 }
 
 async function scrapeCompaniesForAlphabet() {
@@ -98,29 +166,13 @@ async function scrapeCompaniesForAlphabet() {
                 companies.push({ name, url: url.startsWith('http') ? url : `https://theorg.com${url}` });
             }
         });
-        for (const company of companies) {
-            let homepageUrl = '';
-            let companyHtml = await fetchPage(company.url);
-            if (companyHtml) {
-                const $$ = cheerio.load(companyHtml);
-                const homepageLink = $$('a[title="View the website"]');
-                if (homepageLink.length > 0) {
-                    homepageUrl = homepageLink.attr('href') || '';
-                }
-            } else {
-                // If companyHtml is null, check if it was a 404 (handled in fetchPage)
-                // Just skip this company and continue
-                console.log(`Skipping company profile for ${company.name} (page not found or error).`);
-            }
-            fs.appendFileSync(
-                OUTPUT_CSV,
-                `"${pageUrl}","${company.name}","${homepageUrl}"\n`
-            );
-            processedCompaniesSet.add(company.name);
-            saveProgress(pageNum); // Save progress after each company
-            console.log(`Saved: ${company.name}`);
+
+        if (companies.length > 0) {
+            await processBatch(companies, pageUrl);
         }
+
         pageNum++;
+        progress.lastPageNum = pageNum;
     }
     console.log(`Scraping complete for alphabet '${TARGET_ALPHABET}'. Output: ${OUTPUT_CSV}`);
 }
